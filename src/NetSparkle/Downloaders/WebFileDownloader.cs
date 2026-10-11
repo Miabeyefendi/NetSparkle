@@ -59,6 +59,14 @@ namespace NetSparkleUpdater.Downloaders
         /// </summary>
         public RedirectHandler? RedirectHandler { get; set; }
 
+        /// <summary>
+        /// The size of the file that is going to be downloaded, in bytes (e.g. the size from the app cast),
+        /// or 0 if it is not known. Only used for download progress when the server does not send a
+        /// Content-Length header (e.g. when it uses chunked transfer encoding); if the server does send
+        /// the length, that length is used instead.
+        /// </summary>
+        public long ExpectedDownloadSize { get; set; }
+
 #if NETCORE
         /// <summary>
         /// If true, don't check the validity of SSL certificates. Defaults to false.
@@ -163,6 +171,9 @@ namespace NetSparkleUpdater.Downloaders
 
         private async Task StartFileDownloadAsync(Uri? uri, string downloadFilePath)
         {
+            // CancelDownload replaces _cts, so hold on to the one that belongs to this download
+            // in order to be able to tell later on whether this download was canceled
+            CancellationTokenSource? downloadCts = null;
             try
             {
                 if (uri == null)
@@ -178,11 +189,12 @@ namespace NetSparkleUpdater.Downloaders
                 {
                     _cts = new CancellationTokenSource();
                 }
+                downloadCts = _cts;
                 DownloadStarted?.Invoke(this, uri.ToString(), downloadFilePath);
                 using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri))
-                using (HttpResponseMessage response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+                using (HttpResponseMessage response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, downloadCts.Token))
                 {
-                    if (!response.IsSuccessStatusCode || !response.Content.Headers.ContentLength.HasValue)
+                    if (!response.IsSuccessStatusCode)
                     {
                         if ((int)response.StatusCode >= 300 && (int)response.StatusCode <= 399 && RedirectHandler != null)
                         {
@@ -194,12 +206,12 @@ namespace NetSparkleUpdater.Downloaders
                         }
                         else
                         {
-                            throw new NetSparkleException(string.Format("Cannot download file (status code: {1}). {2}", uri.ToString(), response.StatusCode,
-                                !response.Content.Headers.ContentLength.HasValue ? "No content length header sent." : ""));
+                            throw new NetSparkleException(string.Format("Cannot download file (status code: {0}).", response.StatusCode));
                         }
                         return;
                     }
                     long totalLength = 0;
+                    bool isLengthKnown = response.Content.Headers.ContentLength.HasValue;
                     long totalRead = 0;
                     long readCount = 0;
                     _downloadFileLocation = downloadFilePath;
@@ -207,54 +219,77 @@ namespace NetSparkleUpdater.Downloaders
                     using (_fileStream = new FileStream(downloadFilePath, FileMode.Create, FileAccess.Write, FileShare.Read, bufferSize, true))
                     using (Stream contentStream = await response.Content.ReadAsStreamAsync())
                     {
-                        totalLength = response.Content.Headers.ContentLength ?? 0;
+                        // without a Content-Length header, we don't know how big the file is; use the expected size, if any
+                        totalLength = response.Content.Headers.ContentLength ?? Math.Max(ExpectedDownloadSize, 0);
                         totalRead = 0;
                         readCount = 0;
                         byte[] buffer = new byte[bufferSize]; 
-                        UpdateDownloadProgress(0, totalLength);
+                        UpdateDownloadProgress(0, totalLength, isLengthKnown);
                         IsDownloading = true;
 
                         do
                         {
-                            if (_cts.IsCancellationRequested)
-                            {
-                                DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, true, null));
-                            }
-
-                            int bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+                            int bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, downloadCts.Token);
                             if (bytesRead == 0)
                             {
-                                UpdateDownloadProgress(totalRead, totalLength);
+                                UpdateDownloadProgress(totalRead, totalLength, isLengthKnown);
                                 break;
                             }
                             await _fileStream.WriteAsync(buffer, 0, bytesRead);
                             totalRead += bytesRead;
                             readCount += 1;
                             //await Task.Delay(1000); // for TESTING ONLY ("throttling" the download)
-                            UpdateDownloadProgress(totalRead, totalLength);
+                            UpdateDownloadProgress(totalRead, totalLength, isLengthKnown);
                         } while (IsDownloading);
                         IsDownloading = false;
                     }
                     _fileStream = null;
-                    UpdateDownloadProgress(totalRead, totalLength);
-                    DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, false, null));
+                    if (downloadCts.IsCancellationRequested)
+                    {
+                        // CancelDownload was called, which stopped the loop above, so this download did not finish
+                        DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, true, null));
+                    }
+                    else
+                    {
+                        // the download is done, so we know how big the file was, even if the server didn't tell us
+                        UpdateDownloadProgress(totalRead, isLengthKnown ? totalLength : totalRead, true);
+                        DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, false, null));
+                    }
                 }
             }
             catch (Exception e)
             {
-                _logger?.PrintMessage("Error: {0}", e.Message);
                 IsDownloading = false;
-                DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(e, false, null));
+                if (downloadCts != null && downloadCts.IsCancellationRequested)
+                {
+                    // canceling closes the file and the request, which makes the in-flight read/write throw;
+                    // that isn't a download error, so report it as a cancellation (like LocalFileDownloader does)
+                    _logger?.PrintMessage("WebFileDownloader: Download was canceled");
+                    DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, true, null));
+                }
+                else
+                {
+                    _logger?.PrintMessage("Error: {0}", e.Message);
+                    DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(e, false, null));
+                }
             }
         }
 
-        private void UpdateDownloadProgress(long totalRead, long totalLength)
+        private void UpdateDownloadProgress(long totalRead, long totalLength, bool isLengthKnown)
         {
-            if (totalLength == 0)
+            int percentage = 0;
+            if (!isLengthKnown && totalLength > 0)
             {
-                totalLength = 1; // just in case
+                // totalLength is only an estimate (and could be wrong), so never report the download as
+                // finished (100%) or as bigger than what we have already received before it is done
+                totalLength = Math.Max(totalLength, totalRead);
+                percentage = Math.Min(99, Convert.ToInt32(Math.Round((double)totalRead / totalLength * 100, 0)));
             }
-            int percentage = Convert.ToInt32(Math.Round((double)totalRead / totalLength * 100, 0));
+            else if (totalLength > 0)
+            {
+                percentage = Convert.ToInt32(Math.Round((double)totalRead / totalLength * 100, 0));
+            }
+            // else: the size is not known at all, so the percentage can't be known either
             DownloadProgressChanged?.Invoke(this, new ItemDownloadProgressEventArgs(percentage, this, totalRead, totalLength));
         }
 
