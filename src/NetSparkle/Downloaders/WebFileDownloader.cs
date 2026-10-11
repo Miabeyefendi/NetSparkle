@@ -239,10 +239,12 @@ namespace NetSparkleUpdater.Downloaders
                     {
                         // CancelDownload was called, which stopped the loop above, so this download did not finish
                         DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, true, null));
-                        return;
                     }
-                    UpdateDownloadProgress(totalRead, totalLength);
-                    DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, false, null));
+                    else
+                    {
+                        UpdateDownloadProgress(totalRead, totalLength);
+                        DownloadFileCompleted?.Invoke(this, new AsyncCompletedEventArgs(null, false, null));
+                    }
                 }
             }
             catch (Exception e)
