@@ -1066,6 +1066,11 @@ namespace NetSparkleUpdater
                     {
                         Uri url = Utilities.GetAbsoluteURL(item.DownloadLink, AppCastUrl);
                         LogWriter?.PrintMessage("Starting to download {0} to {1}", item.DownloadLink, _downloadTempFileName);
+                        if (UpdateDownloader is WebFileDownloader webFileDownloader)
+                        {
+                            // used for progress if the server doesn't send the size of the file
+                            webFileDownloader.ExpectedDownloadSize = item.UpdateSize;
+                        }
                         UpdateDownloader?.DownloadFile(url, _downloadTempFileName);
                     };
                     CreateAndShowProgressWindow(item, false);
